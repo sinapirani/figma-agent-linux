@@ -1,0 +1,95 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.arch }}-unknown-linux-musl
+          rustup default stable
+
+      - name: Build
+        run: ./build.sh ${{ matrix.arch }}
+
+      - name: Smoke test
+        run: |
+          dir="$(ls -d dist/figma-agent-linux-*-${{ matrix.arch }})"
+          "$dir/figma-agent" --version
+          font="$(fc-list --format '%{file}\n' | grep -E '\.(ttf|otf)$' | head -1)"
+          [ -z "$font" ] || "$dir/figma-agent" --inspect "$font"
+          "$dir/figma-agent" & pid=$!
+          for i in $(seq 30); do curl -fsS -m 2 http://127.0.0.1:44950/figma/version && break; sleep 1; done
+          curl -fsS -m 10 http://127.0.0.1:44950/figma/font-files | head -c 300; echo
+          # Lookalike origins must not get CORS headers.
+          if curl -fsSI -H 'Origin: https://evilfigma.com' http://127.0.0.1:44950/figma/version | grep -qi access-control-allow-origin; then
+            echo "CORS header sent to a non-Figma origin" >&2; exit 1
+          fi
+          curl -fsSI -H 'Origin: https://www.figma.com' http://127.0.0.1:44950/figma/version | grep -i access-control-allow-origin
+          kill $pid
+
+      - name: Run on Alpine (musl, no glibc)
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" alpine:latest sh -c \
+            '/dist/figma-agent-linux-*-${{ matrix.arch }}/figma-agent --version'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: figma-agent-linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "${GITHUB_REF_NAME}" = "v$version" ] || { echo "tag ${GITHUB_REF_NAME} != v$version" >&2; exit 1; }
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Figma Agent for Linux $GITHUB_REF_NAME" \
+            --notes "Static binaries for any Linux distro (x86_64 and aarch64). Download the archive for your CPU, then:
+
+          \`\`\`
+          tar xzf figma-agent-linux-*.tar.gz
+          cd figma-agent-linux-*/
+          ./install.sh
+          \`\`\`
+
+          Then in Figma: Preferences → Permissions and helpers → Connect."
