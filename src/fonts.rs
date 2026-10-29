@@ -4,12 +4,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 use ttf_parser::{name_id, Face, Tag};
 
 const FONT_EXTENSIONS: [&str; 5] = ["ttf", "otf", "ttc", "otc", "woff"];
+/// Upper bound for a decoded WOFF font, so a malformed file cannot exhaust memory.
+const MAX_WOFF_SIZE: usize = 256 << 20;
+/// Minimum time between rescans triggered by requests for unknown files.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 fn be_u32(d: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes(d.get(at..at + 4)?.try_into().ok()?))
@@ -20,6 +24,7 @@ fn decode_woff(woff: &[u8]) -> Option<Vec<u8>> {
     let flavor = be_u32(woff, 4)?;
     let num_tables = be_u16(woff, 12)? as usize;
     let mut tables = Vec::with_capacity(num_tables);
+    let mut total = 0usize;
     for i in 0..num_tables {
         let at = 44 + i * 20;
         let (tag, offset, comp_len, orig_len, checksum) = (
@@ -29,9 +34,10 @@ fn decode_woff(woff: &[u8]) -> Option<Vec<u8>> {
             be_u32(woff, at + 12)? as usize,
             be_u32(woff, at + 16)?,
         );
+        total = total.checked_add(orig_len).filter(|&t| t <= MAX_WOFF_SIZE)?;
         let raw = woff.get(offset..offset.checked_add(comp_len)?)?;
         let data = if comp_len < orig_len {
-            miniz_oxide::inflate::decompress_to_vec_zlib(raw).ok()?
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(raw, orig_len).ok()?
         } else {
             raw.to_vec()
         };
@@ -332,11 +338,13 @@ pub fn describe_file(path: &str, modified_at: u64) -> Result<Vec<Value>, String>
 #[derive(Default)]
 pub struct FontIndex {
     files: Mutex<HashMap<String, (u64, Vec<Value>)>>,
+    last_scan: Mutex<Option<Instant>>,
 }
 
 impl FontIndex {
     pub fn scan(&self) -> Map<String, Value> {
         let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         let mut fresh = HashMap::new();
         for path in list_font_paths() {
             let Some(mtime) = std::fs::metadata(&path)
@@ -358,6 +366,14 @@ impl FontIndex {
         }
         *files = fresh;
         files.iter().map(|(path, (_, faces))| (path.clone(), Value::Array(faces.clone()))).collect()
+    }
+
+    /// Rescan unless the last scan was recent, so requests for unknown files cannot keep the agent busy.
+    pub fn rescan_if_stale(&self) {
+        let last = *self.last_scan.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|t| t.elapsed() >= RESCAN_INTERVAL) {
+            self.scan();
+        }
     }
 
     /// Only files we indexed ourselves are ever served.

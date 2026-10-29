@@ -10,6 +10,7 @@
 //!   GET /figma/health                 -> 200
 //! Every response carries CORS headers for figma.com, and preflights get
 //! Access-Control-Allow-Private-Network so Chrome lets a public page reach localhost.
+//! Requests must name the agent by a loopback Host, which blocks DNS-rebinding pages.
 
 mod fonts;
 mod preview;
@@ -77,7 +78,7 @@ fn preflight(req: &Request) -> Reply {
 
 fn serve_font(index: &FontIndex, path: &str) -> Reply {
     if !index.contains(path) {
-        index.scan();
+        index.rescan_if_stale();
     }
     if !index.contains(path) {
         return not_found("Invalid path");
@@ -128,10 +129,15 @@ fn route(index: &FontIndex, req: &Request) -> Reply {
     }
 }
 
-fn handle(index: &FontIndex, req: Request) {
+fn handle(index: &FontIndex, hosts: &[String], req: Request) {
     let origin = request_header(&req, "Origin").filter(|o| is_figma_origin(o));
-    let mut resp = catch_unwind(AssertUnwindSafe(|| route(index, &req)))
-        .unwrap_or_else(|_| reply(500, json!({ "error": "internal error" }).to_string(), "application/json"));
+    let host = request_header(&req, "Host").unwrap_or_default().to_ascii_lowercase();
+    let mut resp = if !hosts.contains(&host) {
+        reply(403, json!({ "error": "Forbidden host" }).to_string(), "application/json")
+    } else {
+        catch_unwind(AssertUnwindSafe(|| route(index, &req)))
+            .unwrap_or_else(|_| reply(500, json!({ "error": "internal error" }).to_string(), "application/json"))
+    };
     if let Some(origin) = origin {
         resp = resp
             .with_header(header("Access-Control-Allow-Origin", &origin))
@@ -167,6 +173,13 @@ fn main() {
     let host = std::env::var("FIGMA_AGENT_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("FIGMA_AGENT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(44950);
 
+    // Host header values we answer to; anything else is a DNS-rebinding attempt.
+    let hosts: Arc<Vec<String>> = Arc::new(
+        ["127.0.0.1", "localhost", "[::1]", host.as_str()]
+            .iter()
+            .map(|name| format!("{}:{port}", name.to_ascii_lowercase()))
+            .collect(),
+    );
     let index = Arc::new(FontIndex::default());
     let started = Instant::now();
     let count = index.scan().len();
@@ -183,10 +196,10 @@ fn main() {
 
     let workers: Vec<_> = (0..WORKERS)
         .map(|_| {
-            let (server, index) = (server.clone(), index.clone());
+            let (server, index, hosts) = (server.clone(), index.clone(), hosts.clone());
             std::thread::spawn(move || {
                 for req in server.incoming_requests() {
-                    handle(&index, req);
+                    handle(&index, &hosts, req);
                 }
             })
         })

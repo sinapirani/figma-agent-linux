@@ -21,7 +21,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         run: |
@@ -45,6 +45,8 @@ jobs:
             echo "CORS header sent to a non-Figma origin" >&2; exit 1
           fi
           curl -fsSI -H 'Origin: https://www.figma.com' http://127.0.0.1:44950/figma/version | grep -i access-control-allow-origin
+          # DNS-rebinding pages (foreign Host header) are refused.
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example:44950' http://127.0.0.1:44950/figma/font-files)" = 403 ]
           kill $pid
 
       - name: Run on Alpine (musl, no glibc)
@@ -52,7 +54,7 @@ jobs:
           docker run --rm -v "$PWD/dist:/dist:ro" alpine:latest sh -c \
             '/dist/figma-agent-linux-*-${{ matrix.arch }}/figma-agent --version'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: figma-agent-linux-${{ matrix.arch }}
           path: |
@@ -66,14 +68,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check tag matches Cargo.toml
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           [ "${GITHUB_REF_NAME}" = "v$version" ] || { echo "tag ${GITHUB_REF_NAME} != v$version" >&2; exit 1; }
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
